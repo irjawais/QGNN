@@ -138,6 +138,3 @@ If you use this code, please cite:
 
 This project is licensed under the MIT License.
 
-## Acknowledgments
-
-This work was supported by FCT/MECI through national funds and co-funded EU funds under UID/50008: Instituto de Telecomunicacoes, and ManagiDiTH, 101083896 DIGITAL-2021-SKILLS-01 EU project.
