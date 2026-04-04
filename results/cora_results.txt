@@ -1,6 +1,0 @@
-Dataset: cora
-Metric: accuracy
-Mean: 0.1720
-Std: 0.0000
-All runs: [0.172]
-Args: {'dataset': 'cora', 'data_root': './data', 'hidden_channels': 16, 'num_layers': 2, 'dropout': 0.2, 'alpha': 0.1, 'beta': 0.1, 'k': 16, 'lr': 0.001, 'weight_decay': 0.0005, 'epochs': 50, 'patience': 30, 'seed': 42, 'runs': 1, 'device': 'auto', 'save_dir': './results', 'verbose': True}
