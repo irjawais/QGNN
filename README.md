@@ -71,6 +71,37 @@ python train.py --dataset pascalvoc-sp --alpha 0.1 --epochs 500 --k 32
 bash experiments/run_all.sh
 ```
 
+### Note on Runtime
+
+This implementation computes the top-k eigenvalues via `torch.linalg.eigvalsh`
+(full eigendecomposition, O(n^3)) rather than an iterative O(k*n^2) method.
+We made this choice for numerical stability: `torch.lobpcg`'s backward pass
+performs an internal Cholesky factorization that fails on the near-degenerate
+spectra common early in training. As a consequence, the per-epoch wall-clock
+time on Cora/Citeseer is higher than the figures reported in Table 5 of the
+paper, but the final accuracy numbers are unaffected. For the LRGB datasets
+the difference is negligible because each graph is small (~500 nodes per
+batch element).
+
+### Note on the Global Correlation Term for Variable-Size Graphs
+
+Paper Equation 5 defines the global correlation term as `β · ρ^(l) V^(l)`
+with `V^(l) ∈ R^(n × d_{l+1})` as a standalone learnable parameter. For
+fixed-size graphs (Cora, Citeseer), `V` is instantiated exactly this way
+as an `nn.Parameter(n, d)` — matching the paper verbatim.
+
+For variable-size graphs (PPI, LRGB, Circuits), `n` differs between
+samples, so a fixed-shape parameter is not possible. In those cases we
+parameterize `V^(l) = H^(l) W_V^(l)` where `W_V ∈ R^(d_l × d_{l+1})` is
+learnable. The global term expands to:
+
+    ρ V = (1/n) H H^T · (H W_V) = (1/n) H (H^T H) W_V
+
+This lies in the column space of `H` rather than being a free `n × d`
+parameter. It is the standard way to port Equation 5 to graph-level
+tasks with variable `n`. The fixed-n path (Cora/Citeseer) retains the
+exact paper formulation.
+
 ### Key Hyperparameters
 
 | Parameter | Default | Description |

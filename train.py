@@ -2,7 +2,7 @@
 Training script for QGNN with Quantum Entanglement Loss.
 
 Supports node classification, graph classification, graph regression,
-and multi-label classification across all benchmark datasets.
+multi-label classification, and link prediction across all benchmarks.
 
 Usage:
     python train.py --dataset cora
@@ -18,7 +18,6 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, average_precision_score
 
@@ -47,7 +46,7 @@ def get_args():
     # QEL hyperparameters
     parser.add_argument("--alpha", type=float, default=0.1, help="QEL weight")
     parser.add_argument("--beta", type=float, default=0.1, help="Global correlation strength")
-    parser.add_argument("--k", type=int, default=16, help="Top-k eigenvalues for entropy")
+    parser.add_argument("--k", type=int, default=None, help="Top-k eigenvalues (None=adaptive)")
 
     # Training
     parser.add_argument("--lr", type=float, default=0.001)
@@ -94,8 +93,10 @@ def train_fullbatch(model, data, optimizer, task):
 
     out, qel = model(data.x, data.edge_index)
 
-    if task == "node_classification":
-        loss_task = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
+    if task == "multilabel":
+        loss_task = F.binary_cross_entropy_with_logits(
+            out[data.train_mask], data.y[data.train_mask].float()
+        )
     else:
         loss_task = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
 
@@ -106,16 +107,12 @@ def train_fullbatch(model, data, optimizer, task):
 
 
 @torch.no_grad()
-def eval_fullbatch(model, data, task, mask):
+def eval_fullbatch(model, data, task, metric, mask):
     model.eval()
     out, _ = model(data.x, data.edge_index)
-
-    if task == "node_classification":
-        pred = out[mask].argmax(dim=-1)
-        correct = (pred == data.y[mask]).sum().item()
-        total = mask.sum().item()
-        return correct / total
-    return 0.0
+    out = out[mask]
+    labels = data.y[mask]
+    return compute_metric(out.cpu(), labels.cpu(), task, metric)
 
 
 # ---------------------------------------------------------------------------
@@ -131,18 +128,24 @@ def train_batched(model, loader, optimizer, task, device):
         batch = batch.to(device)
         optimizer.zero_grad()
 
-        out, qel = model(batch.x, batch.edge_index, batch.batch)
+        # Link prediction passes edge_label_index
+        edge_label_index = getattr(batch, "edge_label_index", None)
+        out, qel = model(
+            batch.x, batch.edge_index, batch.batch,
+            edge_label_index=edge_label_index,
+        )
 
-        if task == "graph_classification":
-            loss_task = F.cross_entropy(out, batch.y)
+        if task == "multilabel":
+            loss_task = F.binary_cross_entropy_with_logits(out, batch.y.float())
         elif task == "graph_regression":
             loss_task = F.l1_loss(out, batch.y.float())
-        elif task == "multilabel":
-            loss_task = F.binary_cross_entropy_with_logits(out, batch.y.float())
+        elif task == "link_prediction":
+            edge_label = getattr(batch, "edge_label", batch.y)
+            loss_task = F.binary_cross_entropy_with_logits(
+                out.squeeze(), edge_label.float()
+            )
         elif task == "node_classification":
             loss_task = F.cross_entropy(out, batch.y)
-        elif task == "link_prediction":
-            loss_task = F.binary_cross_entropy_with_logits(out.squeeze(), batch.y.float())
         else:
             loss_task = F.cross_entropy(out, batch.y)
 
@@ -164,20 +167,19 @@ def eval_batched(model, loader, task, metric, device):
 
     for batch in loader:
         batch = batch.to(device)
-        out, _ = model(batch.x, batch.edge_index, batch.batch)
+        edge_label_index = getattr(batch, "edge_label_index", None)
+        out, _ = model(
+            batch.x, batch.edge_index, batch.batch,
+            edge_label_index=edge_label_index,
+        )
 
-        if task == "graph_regression":
-            all_preds.append(out.cpu())
-            all_labels.append(batch.y.cpu())
-        elif task == "graph_classification":
-            all_preds.append(out.cpu())
-            all_labels.append(batch.y.cpu())
-        elif task == "multilabel":
+        if task == "multilabel":
             all_preds.append(torch.sigmoid(out).cpu())
             all_labels.append(batch.y.cpu())
-        elif task == "node_classification":
-            all_preds.append(out.cpu())
-            all_labels.append(batch.y.cpu())
+        elif task == "link_prediction":
+            all_preds.append(torch.sigmoid(out).cpu())
+            edge_label = getattr(batch, "edge_label", batch.y)
+            all_labels.append(edge_label.cpu())
         else:
             all_preds.append(out.cpu())
             all_labels.append(batch.y.cpu())
@@ -215,10 +217,43 @@ def compute_metric(preds, labels, task, metric):
         return F.l1_loss(preds, labels.float()).item()
 
     elif metric == "hits_at_10":
-        # Simplified hits@10 computation
-        return 0.0  # Requires specialized link prediction evaluation
+        return _hits_at_k(preds, labels, k=10)
 
     return 0.0
+
+
+def _hits_at_k(preds: torch.Tensor, labels: torch.Tensor, k: int = 10) -> float:
+    """Compute Hits@K metric for link prediction (vectorized).
+
+    For each positive edge, rank it among all negative candidates and check
+    if it appears in the top-K. Vectorized for PCQM-Contact scale.
+
+    Args:
+        preds: Predicted scores of shape (E,) or (E, 1).
+        labels: Binary labels of shape (E,).
+        k: Top-K threshold.
+
+    Returns:
+        Hits@K score between 0 and 1.
+    """
+    preds = preds.squeeze()
+    labels = labels.squeeze()
+
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+
+    if pos_mask.sum() == 0 or neg_mask.sum() == 0:
+        return 0.0
+
+    pos_scores = preds[pos_mask]        # (P,)
+    neg_scores = preds[neg_mask]        # (N,)
+
+    # Vectorized: for each positive, count negatives scoring >= it
+    # ranks shape: (P,) — rank of each positive among negatives
+    ranks = (neg_scores.unsqueeze(0) >= pos_scores.unsqueeze(1)).sum(dim=1) + 1
+    hits = (ranks <= k).float().mean().item()
+
+    return hits
 
 
 def run_single(args, dataset_info, device, run_idx):
@@ -239,6 +274,8 @@ def run_single(args, dataset_info, device, run_idx):
         dropout=args.dropout,
         k=args.k,
         task=task,
+        fixed_n=config.get("fixed_n"),
+        node_sample_size=config.get("node_sample_size"),
     ).to(device)
 
     optimizer = torch.optim.Adam(
@@ -266,8 +303,8 @@ def run_single(args, dataset_info, device, run_idx):
 
         # Evaluate
         if is_fullbatch:
-            val_metric = eval_fullbatch(model, data, task, data.val_mask)
-            test_metric = eval_fullbatch(model, data, task, data.test_mask)
+            val_metric = eval_fullbatch(model, data, task, metric_name, data.val_mask)
+            test_metric = eval_fullbatch(model, data, task, metric_name, data.test_mask)
         else:
             val_metric = eval_batched(
                 model, dataset_info["val_loader"], task, metric_name, device
@@ -307,7 +344,7 @@ def main():
     device = get_device(args.device)
     print(f"Device: {device}")
     print(f"Dataset: {args.dataset}")
-    print(f"QEL alpha={args.alpha}, beta={args.beta}, k={args.k}")
+    print(f"QEL alpha={args.alpha}, beta={args.beta}, k={args.k or 'adaptive'}")
     print(f"Architecture: {args.num_layers} layers, hidden_dim={args.hidden_channels}")
     print("-" * 60)
 
